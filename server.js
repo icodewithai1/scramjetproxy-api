@@ -21,12 +21,62 @@ if (typeof importScripts === "function" && typeof self !== "undefined" && !("win
   importScripts(
     "https://cdn.jsdelivr.net/npm/@mercuryworkshop/scramjet@1.1.0/dist/scramjet.all.js"
   );
-  const { ScramjetServiceWorker } = $scramjetLoadWorker();
-  const scramjet = new ScramjetServiceWorker();
+
+  /* Scramjet assumes the PAGE creates its IndexedDB stores first. On a fresh
+     visit this SW runs first instead, so we create (or repair) the DB here
+     BEFORE constructing ScramjetServiceWorker — otherwise init() throws:
+     "One of the specified object stores was not found". */
+  const SJ_DB = "$scramjet";
+  const SJ_DB_VERSION = 1;
+  const SJ_STORES = ["config", "cookies", "redirectTrackers", "referrerPolicies", "publicSuffixList"];
+
+  function sjOpenDB() {
+    return new Promise((resolve) => {
+      const req = indexedDB.open(SJ_DB, SJ_DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        for (const s of SJ_STORES) {
+          if (!db.objectStoreNames.contains(s)) db.createObjectStore(s);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+      req.onblocked = () => resolve(null);
+    });
+  }
+
+  const ready = (async () => {
+    try {
+      let db = await sjOpenDB();
+      if (db) {
+        const healthy = SJ_STORES.every((s) => db.objectStoreNames.contains(s));
+        db.close();
+        if (!healthy) {
+          // leftover broken/empty DB (e.g. from an older version) -> recreate
+          await new Promise((resolve) => {
+            const del = indexedDB.deleteDatabase(SJ_DB);
+            del.onsuccess = del.onerror = del.onblocked = () => resolve();
+          });
+          db = await sjOpenDB();
+          if (db) db.close();
+        }
+      }
+    } catch (e) {
+      /* never block startup on DB issues */
+    }
+    const { ScramjetServiceWorker } = $scramjetLoadWorker();
+    return new ScramjetServiceWorker();
+  })();
+
+  // take control of open pages immediately (more reliable first-visit loads)
+  self.addEventListener("activate", (event) => {
+    event.waitUntil(self.clients.claim());
+  });
 
   self.addEventListener("fetch", (event) => {
     event.respondWith(
       (async () => {
+        const scramjet = await ready;
         await scramjet.loadConfig();
         if (scramjet.route(event)) return scramjet.fetch(event);
         return fetch(event.request); // not a proxied request -> pass through
