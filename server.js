@@ -73,11 +73,34 @@ if (typeof importScripts === "function" && typeof self !== "undefined" && !("win
     event.waitUntil(self.clients.claim());
   });
 
+  /* scramjet 1.1.0 bug: the page's controller posts a "loadConfig" message
+     which sets this.config WITHOUT initializing the rewriter config ($W),
+     and loadConfig() then short-circuits on `if(this.config) return`, so
+     every fetch crashes with "Cannot read properties of undefined
+     (reading 'prefix')". Fix: force the IndexedDB code-path of loadConfig
+     once — that path runs the real setConfig() + rewriter init. */
+  let sjConfigInited = false;
+
   self.addEventListener("fetch", (event) => {
     event.respondWith(
       (async () => {
         const scramjet = await ready;
-        await scramjet.loadConfig();
+        if (!sjConfigInited) {
+          scramjet.config = undefined; // force full IDB path (runs setConfig)
+          await scramjet.loadConfig();
+          if (scramjet.config) sjConfigInited = true;
+        } else {
+          await scramjet.loadConfig();
+        }
+        if (!scramjet.config) {
+          // config not in IndexedDB yet (page still booting) -> retry a bit
+          console.warn("[sj-sw] config missing for", event.request.url, "- waiting for page init");
+          for (let i = 0; i < 20 && !scramjet.config; i++) {
+            await new Promise((r) => setTimeout(r, 250));
+            scramjet.config = undefined;
+            await scramjet.loadConfig();
+          }
+        }
         if (scramjet.route(event)) return scramjet.fetch(event);
         return fetch(event.request); // not a proxied request -> pass through
       })()
