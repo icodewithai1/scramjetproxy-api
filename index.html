@@ -155,8 +155,7 @@ const PIN = {
 /* public wisp relays, tried in order when WISP_URL is empty (or fails) */
 const WISP_FALLBACKS = [
   "wss://wisp.mercurywork.shop/",
-  "wss://wispserver.dev/wisp/",
-  "wss://glseries.net/wisp/",
+  "wss://admin.proxy.hydrovolter.com/scramjet/wisp/",
 ];
 
 const $ = (id) => document.getElementById(id);
@@ -188,25 +187,47 @@ function resolveInput(raw) {
   return "https://duckduckgo.com/?q=" + encodeURIComponent(raw);
 }
 
-/* ---------- bare-mux worker from a blob (no extra file needed) ----------- */
-let _workerSrc = null;
-async function getWorkerSrc() {
-  if (!_workerSrc) {
-    const src = await (await fetch(PIN.baremux + "/worker.js")).text();
-    // adapt the SharedWorker script so it also runs as a plain dedicated worker
-    _workerSrc = src +
-      "\n;self.addEventListener('message', function (ev) {" +
-      "  if (ev.ports && ev.ports[0]) self.onconnect({ ports: ev.ports });" +
-      "});";
+/* ---------- bare-mux worker from a blob (no extra file needed) ----------
+   ONE singleton dedicated worker + many MessagePorts into it — this mimics
+   the SharedWorker bare-mux normally uses. (Creating a worker per port
+   floods the "refreshPort" broadcast channel and deadlocks transport.) */
+let _workerSrcPromise = null;
+function getWorkerSrc() {
+  if (!_workerSrcPromise) {
+    _workerSrcPromise = (async () => {
+      let src = await (await fetch(PIN.baremux + "/worker.js")).text();
+      // Patch: libcurl's init() can be called before its embedded wasm is
+      // instantiated (it throws "wasm not loaded yet"). Wrap init() in a
+      // retry loop so early fetches wait for the wasm instead of failing.
+      const retryInit =
+        "s.ready||await (async()=>{for(let _k=0;;_k++){try{await s.init();break}" +
+        "catch(_e){if(_k>50)throw _e;await new Promise(_r=>setTimeout(_r,100))}}})(),";
+      if (src.includes("s.ready||await s.init(),")) {
+        src = src.split("s.ready||await s.init(),").join(retryInit);
+      }
+      // adapt the SharedWorker script so it also runs as a plain dedicated worker
+      return src +
+        "\n;self.addEventListener('message', function (ev) {" +
+        "  if (ev.ports && ev.ports[0]) self.onconnect({ ports: ev.ports });" +
+        "});";
+    })();
   }
-  return _workerSrc;
+  return _workerSrcPromise;
+}
+let _bareWorkerPromise = null;
+function getBareWorker() {
+  if (!_bareWorkerPromise) {
+    _bareWorkerPromise = getWorkerSrc().then(
+      (src) => new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })))
+    );
+  }
+  return _bareWorkerPromise;
 }
 async function createBarePort() {
-  const src = await getWorkerSrc();
-  const worker = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+  const worker = await getBareWorker();
   const mc = new MessageChannel();
-  worker.postMessage(null, [mc.port1]);
-  return mc.port2;
+  worker.postMessage(null, [mc.port1]); // hands port1 to the worker -> onconnect
+  return mc.port2;                      // caller talks over port2
 }
 // the service worker asks windows for a transport port -> hand it one
 navigator.serviceWorker && navigator.serviceWorker.addEventListener("message", async (ev) => {
@@ -229,12 +250,18 @@ function wispAlive(url, ms = 4500) {
   });
 }
 async function pickWisp() {
-  const list = window.WISP_URL ? [window.WISP_URL, ...WISP_FALLBACKS] : WISP_FALLBACKS;
+  const params = new URLSearchParams(location.search);
+  const forced = params.get("wisp"); // escape hatch: ?wisp=wss://your.server/wisp/
+  const list = forced
+    ? [forced]
+    : window.WISP_URL
+      ? [window.WISP_URL, ...WISP_FALLBACKS]
+      : WISP_FALLBACKS;
   const results = await Promise.allSettled(list.map((u) => wispAlive(u)));
   for (let i = 0; i < results.length; i++) {
     if (results[i].status === "fulfilled") return list[i];
   }
-  throw new Error("No wisp relay is reachable. Set window.WISP_URL at the top of index.html to a working wisp endpoint.");
+  throw new Error("No wisp relay is reachable. Set window.WISP_URL at the top of index.html (or add ?wisp=wss://... to the URL) to a working wisp endpoint.");
 }
 
 /* ---------- boot: service worker + scramjet controller ---------- */
@@ -245,6 +272,7 @@ async function boot() {
     await loadScript(PIN.baremux + "/index.js");
 
     if (!("serviceWorker" in navigator)) throw new Error("This browser doesn't support service workers.");
+    getBareWorker(); // start preloading the transport worker immediately
     await navigator.serviceWorker.register(BASE + "server.js"); // server.js doubles as the SW
     await navigator.serviceWorker.ready;
     setChip("sw", "ok", "service worker");
@@ -319,5 +347,5 @@ $("t-home").onclick   = () => { $("browse").style.display = "none"; $("home").st
 
 boot();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a3b219f29936c665',t:'MTc4OTQxNzMyMQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a3ba69aefc676417',t:'MTc4OTUwNDQ3Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
