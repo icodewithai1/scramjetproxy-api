@@ -104,6 +104,33 @@ if (typeof importScripts === "function" && typeof self !== "undefined" && !("win
       // anything matching a controller prefix -> RPC to the page's Controller
       if ($scramjetController.shouldRoute(event)) {
         event.respondWith($scramjetController.route(event));
+        return;
+      }
+      // a proxied-looking request that no controller claimed (e.g. the page
+      // is an old cached copy from a previous version) -> explain instead of
+      // falling through to the host's own 404 page
+      if (
+        event.request.mode === "navigate" &&
+        url.origin === self.location.origin &&
+        url.pathname.startsWith(sjBase() + "scramjet/")
+      ) {
+        event.respondWith(
+          Promise.resolve(
+            new Response(
+              "<!doctype html><meta charset=utf-8><title>Update needed</title>" +
+                "<body style='font:15px system-ui;padding:40px;max-width:560px'>" +
+                "<h2>Scramjet Gateway was updated</h2>" +
+                "<p>The page you have open is an old cached version and can't talk to the new service worker.</p>" +
+                "<p><b>Hard-refresh this tab</b> (or close it and open the site again)." +
+                " On a phone: close ALL tabs of this site, then reopen it.</p>" +
+                "<p><button onclick=\"window.top.location.replace('" +
+                sjBase() +
+                "?r=' + Date.now())\">Reload the site</button></p>",
+              { status: 200, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
+            )
+          )
+        );
+        return;
       }
       // everything else falls through to the network
     } catch (err) {
