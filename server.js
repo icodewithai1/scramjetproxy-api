@@ -123,9 +123,11 @@ if (typeof importScripts === "function" && typeof self !== "undefined" && !("win
                 "<p>The page you have open is an old cached version and can't talk to the new service worker.</p>" +
                 "<p><b>Hard-refresh this tab</b> (or close it and open the site again)." +
                 " On a phone: close ALL tabs of this site, then reopen it.</p>" +
-                "<p><button onclick=\"window.top.location.replace('" +
+                "<p><button onclick=\"try{window.top.location.replace('" +
                 sjBase() +
-                "?r=' + Date.now())\">Reload the site</button></p>",
+                "?r=' + Date.now())}catch(e){location.replace('" +
+                sjBase() +
+                "?r=' + Date.now())}\">Reload the site</button></p>",
               { status: 200, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
             )
           )
