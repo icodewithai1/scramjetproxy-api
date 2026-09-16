@@ -139,20 +139,23 @@
 
 <script>
 /* ============================================================================
-   ⚙️ OPTIONAL — only if you want to use YOUR OWN wisp server:
+   Scramjet v2 wiring. Two-file design (this file + server.js as the SW):
+   everything else loads from CDN, and the rewriter runtime itself is served
+   by the service worker as a virtual file (sj-runtime.js).
+
+   ⚙️ OPTIONAL — use YOUR OWN wisp server instead of the public relays:
        window.WISP_URL = "wss://your-server.com/wisp/";
-   Leave it "" to auto-pick a working public relay. Nothing else to edit.
    ============================================================================ */
 window.WISP_URL = "";
 
-/* pinned library versions */
+/* pinned v2 builds (controller build must match the runtime version) */
 const PIN = {
-  scramjet: "https://cdn.jsdelivr.net/npm/@mercuryworkshop/scramjet@1.1.0/dist",
-  baremux:  "https://cdn.jsdelivr.net/npm/@mercuryworkshop/bare-mux@2.1.9/dist",
-  libcurl:  "https://cdn.jsdelivr.net/npm/@mercuryworkshop/libcurl-transport@1.5.2/dist/index.mjs",
+  scramjet:   "https://cdn.jsdelivr.net/npm/@mercuryworkshop/scramjet@2.0.67-alpha.2/dist",
+  controller: "https://cdn.jsdelivr.net/npm/@mercuryworkshop/scramjet-controller@0.0.14/dist",
+  libcurl:    "https://cdn.jsdelivr.net/npm/@mercuryworkshop/libcurl-transport@2.0.5/dist/index.js",
 };
 
-/* public wisp relays, tried in order when WISP_URL is empty (or fails) */
+/* public wisp relays, raced/attempted in order when WISP_URL is empty */
 const WISP_FALLBACKS = [
   "wss://wisp.mercurywork.shop/",
   "wss://admin.proxy.hydrovolter.com/scramjet/wisp/",
@@ -160,9 +163,11 @@ const WISP_FALLBACKS = [
 
 const $ = (id) => document.getElementById(id);
 const BASE = new URL(".", location.href).pathname; // works on "/" and "/repo-name/"
+const PREFIX = BASE + "scramjet/";
 const banner = $("banner");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-let controller = null, connection = null, frame = null, booted = false, chosenWisp = null, transportKey = null;
+let controller = null, frame = null, booted = false, chosenWisp = null, transport = null;
 const chips = { sw: $("chip-sw"), wisp: $("chip-wisp") };
 function setChip(name, state, text) {
   chips[name].className = "chip " + state;
@@ -187,91 +192,15 @@ function resolveInput(raw) {
   return "https://duckduckgo.com/?q=" + encodeURIComponent(raw);
 }
 
-/* ---------- bare-mux worker from a blob (no extra file needed) ----------
-   ONE singleton dedicated worker + many MessagePorts into it — this mimics
-   the SharedWorker bare-mux normally uses. (Creating a worker per port
-   floods the "refreshPort" broadcast channel and deadlocks transport.) */
-let _workerSrcPromise = null;
-function getWorkerSrc() {
-  if (!_workerSrcPromise) {
-    _workerSrcPromise = (async () => {
-      let src = await (await fetch(PIN.baremux + "/worker.js")).text();
-      // Patch: libcurl's init() can be called before its embedded wasm is
-      // instantiated (it throws "wasm not loaded yet"). Wrap init() in a
-      // retry loop so early fetches wait for the wasm instead of failing.
-      const retryInit =
-        "s.ready||await (async()=>{for(let _k=0;;_k++){try{await s.init();break}" +
-        "catch(_e){if(_k>50)throw _e;await new Promise(_r=>setTimeout(_r,100))}}})(),";
-      if (src.includes("s.ready||await s.init(),")) {
-        src = src.split("s.ready||await s.init(),").join(retryInit);
-      }
-      // adapt the SharedWorker script so it also runs as a plain dedicated worker
-      return src +
-        "\n;self.addEventListener('message', function (ev) {" +
-        "  if (ev.ports && ev.ports[0]) self.onconnect({ ports: ev.ports });" +
-        "});";
-    })();
-  }
-  return _workerSrcPromise;
-}
-let _bareWorkerPromise = null;
-function getBareWorker() {
-  if (!_bareWorkerPromise) {
-    _bareWorkerPromise = getWorkerSrc().then(
-      (src) => new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })))
-    );
-  }
-  return _bareWorkerPromise;
-}
-async function createBarePort() {
-  const worker = await getBareWorker();
-  const mc = new MessageChannel();
-  worker.postMessage(null, [mc.port1]); // hands port1 to the worker -> onconnect
-  return mc.port2;                      // caller talks over port2
+/* older Safari has no BroadcastChannel; the controller only uses it for
+   cross-tab cookie sync, so a do-nothing stub keeps it running */
+if (!("BroadcastChannel" in window)) {
+  window.BroadcastChannel = class {
+    postMessage() {} addEventListener() {} removeEventListener() {} close() {}
+  };
 }
 
-/* ---------- capability probe (Safari/iOS fallback) -----------------------
-   The fast path runs the libcurl transport INSIDE the worker, which needs
-   dynamic import() + WebSocket in workers. Older Safari/iOS versions lack
-   those — probe once; if missing, run the transport in the page instead
-   (the worker then just relays messages). */
-let _capsPromise = null;
-function probeWorkerCaps() {
-  if (!_capsPromise) {
-    _capsPromise = new Promise((resolve) => {
-      const params = new URLSearchParams(location.search);
-      if (params.get("remote") === "1") return resolve({ imp: false, ws: false, forced: "remote" });
-      if (params.get("worker") === "1") return resolve({ imp: true, ws: true, forced: "worker" });
-      try {
-        const code =
-          "self.onmessage=function(){var caps={imp:false,ws:typeof WebSocket==='function'};" +
-          "try{import(" + JSON.stringify(PIN.baremux + "/index.mjs") + ").then(function(){caps.imp=true;self.postMessage(caps);},function(){self.postMessage(caps);});}" +
-          "catch(e){self.postMessage(caps);}};";
-        const w = new Worker(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
-        const t = setTimeout(() => { try { w.terminate(); } catch {} resolve(null); }, 5000);
-        w.onmessage = (e) => { clearTimeout(t); try { w.terminate(); } catch {} resolve(e.data); };
-        w.onerror = () => { clearTimeout(t); resolve(null); };
-        w.postMessage(0);
-      } catch {
-        resolve(null);
-      }
-    });
-  }
-  return _capsPromise;
-}
-function useRemoteTransport(caps) {
-  return !caps || !caps.imp || !caps.ws;
-}
-// the service worker asks windows for a transport port -> hand it one
-navigator.serviceWorker && navigator.serviceWorker.addEventListener("message", async (ev) => {
-  if (!ev.data || ev.data.type !== "getPort" || !ev.data.port) return;
-  try {
-    const port = await createBarePort();
-    ev.data.port.postMessage(port, [port]);
-  } catch (err) { console.error("bare-mux getPort failed:", err); }
-});
-
-/* ---------- pick a live wisp server ---------- */
+/* ---------- pick a live wisp relay ---------- */
 function wispAlive(url, ms = 4500) {
   return new Promise((res, rej) => {
     try {
@@ -282,7 +211,7 @@ function wispAlive(url, ms = 4500) {
     } catch (e) { rej(e); }
   });
 }
-async function pickWisp() {
+async function pickWisp(skip = []) {
   const params = new URLSearchParams(location.search);
   const forced = params.get("wisp"); // escape hatch: ?wisp=wss://your.server/wisp/
   const list = forced
@@ -290,46 +219,88 @@ async function pickWisp() {
     : window.WISP_URL
       ? [window.WISP_URL, ...WISP_FALLBACKS]
       : WISP_FALLBACKS;
-  const results = await Promise.allSettled(list.map((u) => wispAlive(u)));
+  const candidates = list.filter((u) => !skip.includes(u));
+  const results = await Promise.allSettled(candidates.map((u) => wispAlive(u)));
   for (let i = 0; i < results.length; i++) {
-    if (results[i].status === "fulfilled") return list[i];
+    if (results[i].status === "fulfilled") return candidates[i];
   }
   throw new Error("No wisp relay is reachable. Set window.WISP_URL at the top of index.html (or add ?wisp=wss://... to the URL) to a working wisp endpoint.");
 }
+async function makeTransport(wisp) {
+  const client = new LibcurlTransport.LibcurlClient({ wisp });
+  for (let k = 0; ; k++) { // init() can race its embedded wasm -> retry
+    try { await client.init(); break; }
+    catch (e) { if (k > 50) throw e; await sleep(100); }
+  }
+  return client;
+}
 
-/* ---------- boot: service worker + scramjet controller ---------- */
+/* proxied URLs look like  <prefix><controllerId>/<frameId>/<encoded real url>
+   -> unwrap them back to the real url for the address bar */
+function unwrapProxyUrl(href) {
+  try {
+    const path = new URL(href).pathname;
+    if (!path.startsWith(PREFIX)) return href;
+    const rest = path.slice(PREFIX.length).split("/");
+    if (rest.length < 3) return href;
+    let encoded = rest.slice(2).join("/");
+    const q = encoded.indexOf("?");
+    if (q !== -1) encoded = encoded.slice(0, q);
+    return decodeURIComponent(encoded);
+  } catch { return href; }
+}
+
+/* ---------- boot ---------- */
 async function boot() {
   try {
     setChip("sw", "warn", "service worker…");
-    await loadScript(PIN.scramjet + "/scramjet.all.js");
-    await loadScript(PIN.baremux + "/index.js");
-
     if (!("serviceWorker" in navigator)) throw new Error("This browser doesn't support service workers.");
-    getBareWorker();    // start preloading the transport worker immediately
-    probeWorkerCaps();  // probe worker capabilities early (Safari fallback)
+
     await navigator.serviceWorker.register(BASE + "server.js"); // server.js doubles as the SW
     await navigator.serviceWorker.ready;
+
+    // the SW calls clients.claim() on activate; wait for this page to be controlled
+    let sw = navigator.serviceWorker.controller;
+    for (let i = 0; i < 20 && !sw; i++) { await sleep(150); sw = navigator.serviceWorker.controller; }
+    if (!sw) {
+      if (!sessionStorage.getItem("sj-reloaded")) { // one full-reload retry
+        sessionStorage.setItem("sj-reloaded", "1");
+        location.reload();
+        return;
+      }
+      throw new Error("Service worker did not take control of the page.");
+    }
+    sessionStorage.removeItem("sj-reloaded");
     setChip("sw", "ok", "service worker");
 
-    const { ScramjetController } = $scramjetLoadController();
-    controller = new ScramjetController({
-      prefix: BASE + "scramjet/",
-      files: {
-        wasm: PIN.scramjet + "/scramjet.wasm.wasm",
-        all:  PIN.scramjet + "/scramjet.all.js",
-        sync: PIN.scramjet + "/scramjet.sync.js",
-      },
-    });
-    await controller.init();
+    // scramjet runtime (served by the SW as a converted classic script),
+    // then the controller API, then the transport
+    await loadScript(BASE + "sj-runtime.js");
+    await loadScript(PIN.controller + "/controller.api.js");
+    await loadScript(PIN.libcurl);
 
-    connection = new BareMux.BareMuxConnection(createBarePort()); // no file, blob worker
-    setChip("wisp", "warn", "wisp idle");
+    setChip("wisp", "warn", "wisp…");
+    chosenWisp = await pickWisp();
+    transport = await makeTransport(chosenWisp);
+
+    controller = new $scramjetController.Controller({
+      serviceworker: sw,
+      transport,
+      config: {
+        prefix: PREFIX,
+        scramjetPath: BASE + "sj-runtime.js",         // SW virtual file
+        injectPath: PIN.controller + "/controller.inject.js",
+        wasmPath: PIN.scramjet + "/scramjet.wasm",
+      },
+      scramjetConfig: $scramjet.defaultConfig,
+    });
+    await controller.wait();
     booted = true;
+    setChip("wisp", "ok", "wisp " + new URL(chosenWisp).host);
 
     $("api-u").textContent = location.origin + BASE + "?u=<encoded url>";
 
-    // deep link:  ?u=<encoded url>
-    const u = new URLSearchParams(location.search).get("u");
+    const u = new URLSearchParams(location.search).get("u"); // deep link
     if (u) navigate(u);
   } catch (err) {
     setChip("sw", "err", "error");
@@ -338,54 +309,24 @@ async function boot() {
 }
 
 /* ---------- navigate ---------- */
-async function navigate(raw) {
+async function navigate(raw, wispSkip = []) {
   const url = resolveInput(raw);
   if (!url) return;
   if (!booted) { showError("Still starting up… try again in a second."); return; }
   banner.style.display = "none";
 
-  try {
-    if (!chosenWisp) chosenWisp = await pickWisp();
-
-    const caps = await probeWorkerCaps();
-    const remote = useRemoteTransport(caps);
-    const wantKey = (remote ? "remote:" : "worker:") + chosenWisp;
-    if (transportKey !== wantKey) {
-      if (remote) {
-        // Safari/compat path: transport runs in the page, worker just relays
-        const mod = await import(PIN.libcurl);
-        const client = new mod.default({ websocket: chosenWisp });
-        for (let k = 0; ; k++) { // init() can race the wasm boot -> retry
-          try { await client.init(); break; }
-          catch (e) { if (k > 50) throw e; await new Promise((r) => setTimeout(r, 100)); }
-        }
-        await connection.setRemoteTransport(client, chosenWisp);
-      } else {
-        if ((await connection.getTransport()) !== PIN.libcurl) {
-          await connection.setTransport(PIN.libcurl, [{ websocket: chosenWisp }]);
-        }
-      }
-      transportKey = wantKey;
-    }
-    setChip("wisp", "ok", "wisp " + new URL(chosenWisp).host + (remote ? " · compat" : ""));
-
-    if (!frame) {
-      frame = controller.createFrame();
-      frame.frame.setAttribute("allow", "fullscreen; clipboard-read; clipboard-write");
-      $("viewer").appendChild(frame.frame);
-      try {
-        frame.addEventListener("urlchange", (e) => { if (e.url) $("t-url").value = e.url; });
-      } catch {}
-    }
-    $("home").style.display = "none";
-    $("browse").style.display = "flex";
-    $("t-url").value = url;
-    await frame.go(url);
-  } catch (err) {
-    chosenWisp = null; // re-pick a relay next time
-    transportKey = null;
-    showError("Navigation failed:\n" + ((err && err.stack) || err));
+  if (!frame) {
+    frame = controller.createFrame();
+    frame.element.setAttribute("allow", "fullscreen; clipboard-read; clipboard-write");
+    $("viewer").appendChild(frame.element);
+    frame.element.addEventListener("load", () => {
+      try { $("t-url").value = unwrapProxyUrl(frame.element.contentWindow.location.href); } catch {}
+    });
   }
+  $("home").style.display = "none";
+  $("browse").style.display = "flex";
+  $("t-url").value = url;
+  frame.go(url);
 }
 
 /* ---------- UI wiring ---------- */
@@ -393,9 +334,9 @@ $("omni").addEventListener("submit", (e) => { e.preventDefault(); navigate($("ad
 document.querySelectorAll(".quick button").forEach((b) =>
   b.addEventListener("click", () => { $("addr").value = b.dataset.u; navigate(b.dataset.u); })
 );
-$("t-back").onclick   = () => { try { frame.frame.contentWindow.history.back(); } catch {} };
-$("t-fwd").onclick    = () => { try { frame.frame.contentWindow.history.forward(); } catch {} };
-$("t-reload").onclick = () => { try { frame.frame.contentWindow.location.reload(); } catch { if (frame) frame.go($("t-url").value); } };
+$("t-back").onclick   = () => { try { frame.back(); } catch {} };
+$("t-fwd").onclick    = () => { try { frame.forward(); } catch {} };
+$("t-reload").onclick = () => { try { frame.reload(); } catch { if (frame) frame.go($("t-url").value); } };
 $("t-home").onclick   = () => { $("browse").style.display = "none"; $("home").style.display = "block"; $("addr").value = ""; $("addr").focus(); };
 
 boot();
