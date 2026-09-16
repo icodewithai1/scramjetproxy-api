@@ -162,7 +162,7 @@ const $ = (id) => document.getElementById(id);
 const BASE = new URL(".", location.href).pathname; // works on "/" and "/repo-name/"
 const banner = $("banner");
 
-let controller = null, connection = null, frame = null, booted = false, chosenWisp = null;
+let controller = null, connection = null, frame = null, booted = false, chosenWisp = null, transportKey = null;
 const chips = { sw: $("chip-sw"), wisp: $("chip-wisp") };
 function setChip(name, state, text) {
   chips[name].className = "chip " + state;
@@ -229,6 +229,39 @@ async function createBarePort() {
   worker.postMessage(null, [mc.port1]); // hands port1 to the worker -> onconnect
   return mc.port2;                      // caller talks over port2
 }
+
+/* ---------- capability probe (Safari/iOS fallback) -----------------------
+   The fast path runs the libcurl transport INSIDE the worker, which needs
+   dynamic import() + WebSocket in workers. Older Safari/iOS versions lack
+   those — probe once; if missing, run the transport in the page instead
+   (the worker then just relays messages). */
+let _capsPromise = null;
+function probeWorkerCaps() {
+  if (!_capsPromise) {
+    _capsPromise = new Promise((resolve) => {
+      const params = new URLSearchParams(location.search);
+      if (params.get("remote") === "1") return resolve({ imp: false, ws: false, forced: "remote" });
+      if (params.get("worker") === "1") return resolve({ imp: true, ws: true, forced: "worker" });
+      try {
+        const code =
+          "self.onmessage=function(){var caps={imp:false,ws:typeof WebSocket==='function'};" +
+          "try{import(" + JSON.stringify(PIN.baremux + "/index.mjs") + ").then(function(){caps.imp=true;self.postMessage(caps);},function(){self.postMessage(caps);});}" +
+          "catch(e){self.postMessage(caps);}};";
+        const w = new Worker(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
+        const t = setTimeout(() => { try { w.terminate(); } catch {} resolve(null); }, 5000);
+        w.onmessage = (e) => { clearTimeout(t); try { w.terminate(); } catch {} resolve(e.data); };
+        w.onerror = () => { clearTimeout(t); resolve(null); };
+        w.postMessage(0);
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+  return _capsPromise;
+}
+function useRemoteTransport(caps) {
+  return !caps || !caps.imp || !caps.ws;
+}
 // the service worker asks windows for a transport port -> hand it one
 navigator.serviceWorker && navigator.serviceWorker.addEventListener("message", async (ev) => {
   if (!ev.data || ev.data.type !== "getPort" || !ev.data.port) return;
@@ -272,7 +305,8 @@ async function boot() {
     await loadScript(PIN.baremux + "/index.js");
 
     if (!("serviceWorker" in navigator)) throw new Error("This browser doesn't support service workers.");
-    getBareWorker(); // start preloading the transport worker immediately
+    getBareWorker();    // start preloading the transport worker immediately
+    probeWorkerCaps();  // probe worker capabilities early (Safari fallback)
     await navigator.serviceWorker.register(BASE + "server.js"); // server.js doubles as the SW
     await navigator.serviceWorker.ready;
     setChip("sw", "ok", "service worker");
@@ -312,10 +346,28 @@ async function navigate(raw) {
 
   try {
     if (!chosenWisp) chosenWisp = await pickWisp();
-    if ((await connection.getTransport()) !== PIN.libcurl) {
-      await connection.setTransport(PIN.libcurl, [{ websocket: chosenWisp }]);
+
+    const caps = await probeWorkerCaps();
+    const remote = useRemoteTransport(caps);
+    const wantKey = (remote ? "remote:" : "worker:") + chosenWisp;
+    if (transportKey !== wantKey) {
+      if (remote) {
+        // Safari/compat path: transport runs in the page, worker just relays
+        const mod = await import(PIN.libcurl);
+        const client = new mod.default({ websocket: chosenWisp });
+        for (let k = 0; ; k++) { // init() can race the wasm boot -> retry
+          try { await client.init(); break; }
+          catch (e) { if (k > 50) throw e; await new Promise((r) => setTimeout(r, 100)); }
+        }
+        await connection.setRemoteTransport(client, chosenWisp);
+      } else {
+        if ((await connection.getTransport()) !== PIN.libcurl) {
+          await connection.setTransport(PIN.libcurl, [{ websocket: chosenWisp }]);
+        }
+      }
+      transportKey = wantKey;
     }
-    setChip("wisp", "ok", "wisp " + new URL(chosenWisp).host);
+    setChip("wisp", "ok", "wisp " + new URL(chosenWisp).host + (remote ? " · compat" : ""));
 
     if (!frame) {
       frame = controller.createFrame();
@@ -331,6 +383,7 @@ async function navigate(raw) {
     await frame.go(url);
   } catch (err) {
     chosenWisp = null; // re-pick a relay next time
+    transportKey = null;
     showError("Navigation failed:\n" + ((err && err.stack) || err));
   }
 }
@@ -347,5 +400,5 @@ $("t-home").onclick   = () => { $("browse").style.display = "none"; $("home").st
 
 boot();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a3ba69aefc676417',t:'MTc4OTUwNDQ3Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>
