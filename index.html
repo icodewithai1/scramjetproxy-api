@@ -152,6 +152,8 @@ window.WISP_URL = "";
 const PIN = {
   scramjet:   "https://cdn.jsdelivr.net/npm/@mercuryworkshop/scramjet@2.0.67-alpha.2/dist",
   controller: "https://cdn.jsdelivr.net/npm/@mercuryworkshop/scramjet-controller@0.0.14/dist",
+  utils:      "https://cdn.jsdelivr.net/npm/@mercuryworkshop/scramjet-utils@0.0.3/dist/scramjet-utils.js",
+  epoxy:      "https://cdn.jsdelivr.net/npm/@mercuryworkshop/epoxy-transport@3.0.1/dist/index.js",
   libcurl:    "https://cdn.jsdelivr.net/npm/@mercuryworkshop/libcurl-transport@2.0.5/dist/index.js",
 };
 
@@ -226,13 +228,30 @@ async function pickWisp(skip = []) {
   }
   throw new Error("No wisp relay is reachable. Set window.WISP_URL at the top of index.html (or add ?wisp=wss://... to the URL) to a working wisp endpoint.");
 }
+/* epoxy = default (browser-like TLS fingerprint -> media sites block it
+   less); libcurl = fallback. ?transport=epoxy|libcurl forces one. */
+let transportKind = new URLSearchParams(location.search).get("transport") || "epoxy";
 async function makeTransport(wisp) {
-  const client = new LibcurlTransport.LibcurlClient({ wisp });
-  for (let k = 0; ; k++) { // init() can race its embedded wasm -> retry
-    try { await client.init(); break; }
-    catch (e) { if (k > 50) throw e; await sleep(100); }
+  const kinds = transportKind === "libcurl" ? ["libcurl", "epoxy"] : ["epoxy", "libcurl"];
+  let lastErr = null;
+  for (const kind of kinds) {
+    try {
+      if (kind === "epoxy") await loadScript(PIN.epoxy);
+      else await loadScript(PIN.libcurl);
+      const Ctor = kind === "epoxy" ? self.EpoxyTransport.default : self.LibcurlTransport.LibcurlClient;
+      const client = new Ctor({ wisp });
+      for (let k = 0; ; k++) { // init() can race its embedded wasm -> retry
+        try { await client.init(); break; }
+        catch (e) { if (k > 50) throw e; await sleep(100); }
+      }
+      transportKind = kind;
+      return client;
+    } catch (e) {
+      lastErr = e;
+      console.warn("transport " + kind + " failed:", e);
+    }
   }
-  return client;
+  throw lastErr || new Error("no transport available");
 }
 
 /* proxied URLs look like  <prefix><controllerId>/<frameId>/<encoded real url>
@@ -250,6 +269,22 @@ function unwrapProxyUrl(href) {
   } catch { return href; }
 }
 
+/* ---------- official v2 plugins (media cache, live URL, tab handling) ---- */
+const deepLink = (u) => location.origin + BASE + "?u=" + encodeURIComponent(u);
+function buildPlugins() {
+  const U = window.$scramjetUtils;
+  const plugins = [];
+  if (!U) return plugins;
+  try { plugins.push(new U.HttpCachePlugin()); } catch (e) { console.warn("http-cache plugin skipped:", e); }
+  try { plugins.push(new U.UrlWatcherPlugin((url) => { $("t-url").value = url; })); } catch {}
+  try { plugins.push(new U.CatchEscapedLinksPlugin((url) => deepLink(url.href || String(url)))); } catch {}
+  try {
+    plugins.push(new U.EventHandlerPlugin());
+    plugins.push(new U.LinkHandlerPlugin((href) => window.open(deepLink(href), "_blank")));
+  } catch {}
+  return plugins;
+}
+
 /* ---------- boot ---------- */
 async function boot() {
   try {
@@ -263,20 +298,23 @@ async function boot() {
     let sw = navigator.serviceWorker.controller;
     for (let i = 0; i < 20 && !sw; i++) { await sleep(150); sw = navigator.serviceWorker.controller; }
     if (!sw) {
-      if (!sessionStorage.getItem("sj-reloaded")) { // one full-reload retry
-        sessionStorage.setItem("sj-reloaded", "1");
+      let reloaded = false;
+      try { reloaded = !!sessionStorage.getItem("sj-reloaded"); } catch {}
+      if (!reloaded) { // one full-reload retry
+        try { sessionStorage.setItem("sj-reloaded", "1"); } catch {}
         location.reload();
         return;
       }
       throw new Error("Service worker did not take control of the page.");
     }
-    sessionStorage.removeItem("sj-reloaded");
+    try { sessionStorage.removeItem("sj-reloaded"); } catch {}
     setChip("sw", "ok", "service worker");
 
     // scramjet runtime (served by the SW as a converted classic script),
-    // then the controller API, then the transport
+    // then the controller API, official utils plugins, then the transport
     await loadScript(BASE + "sj-runtime.js");
     await loadScript(PIN.controller + "/controller.api.js");
+    await loadScript(PIN.utils).catch(() => {}); // plugins optional
     await loadScript(PIN.libcurl);
 
     setChip("wisp", "warn", "wisp…");
@@ -292,11 +330,14 @@ async function boot() {
         injectPath: PIN.controller + "/controller.inject.js",
         wasmPath: PIN.scramjet + "/scramjet.wasm",
       },
-      scramjetConfig: $scramjet.defaultConfig,
+      // tougher rewriting tolerance = heavier sites (yt/tiktok/etc) break less
+      scramjetConfig: {
+        flags: { captureErrors: true, syncxhr: true, allowFailedIntercepts: true },
+      },
     });
     await controller.wait();
     booted = true;
-    setChip("wisp", "ok", "wisp " + new URL(chosenWisp).host);
+    setChip("wisp", "ok", "wisp " + new URL(chosenWisp).host + " · " + transportKind);
 
     $("api-u").textContent = location.origin + BASE + "?u=<encoded url>";
 
@@ -316,8 +357,8 @@ async function navigate(raw, wispSkip = []) {
   banner.style.display = "none";
 
   if (!frame) {
-    frame = controller.createFrame();
-    frame.element.setAttribute("allow", "fullscreen; clipboard-read; clipboard-write");
+    frame = controller.createFrame(undefined, { plugins: buildPlugins() });
+    frame.element.setAttribute("allow", "fullscreen; clipboard-read; clipboard-write; autoplay; encrypted-media; picture-in-picture");
     $("viewer").appendChild(frame.element);
     frame.element.addEventListener("load", () => {
       try { $("t-url").value = unwrapProxyUrl(frame.element.contentWindow.location.href); } catch {}
@@ -341,5 +382,5 @@ $("t-home").onclick   = () => { $("browse").style.display = "none"; $("home").st
 
 boot();
 </script>
-</body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a3c380128f05f733',t:'MTc4OTU5OTc2Mg=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
