@@ -95,10 +95,25 @@
 <header>
   <div class="logo">🛰️ <b>Scramjet</b> Gateway</div>
   <div class="chips">
+    <span class="chip" id="chip-cloak" title="Cloak / anti-nosy tools" style="cursor:pointer"><span class="dot"></span>cloak</span>
     <span class="chip" id="chip-sw"><span class="dot"></span>service worker</span>
     <span class="chip" id="chip-wisp"><span class="dot"></span>wisp</span>
   </div>
 </header>
+
+<div id="cloakbox" style="display:none;position:fixed;top:52px;right:14px;z-index:50;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;width:270px;box-shadow:0 12px 40px rgba(0,0,0,.5)">
+  <div style="font-weight:700;margin-bottom:8px">🎭 Cloak</div>
+  <label style="font-size:12.5px;color:var(--dim)">Tab disguise</label>
+  <select id="cloak-sel" style="width:100%;margin:4px 0 10px;padding:8px;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px">
+    <option value="none">Off (real title)</option>
+    <option value="classroom">Google Classroom</option>
+    <option value="docs">Google Docs</option>
+    <option value="drive">Google Drive</option>
+    <option value="gmail">Gmail</option>
+  </select>
+  <button id="cloak-blank" style="width:100%;padding:9px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer;margin-bottom:8px">Open in about:blank</button>
+  <div style="font-size:12px;color:var(--dim)">Panic key: press <code style="background:var(--panel2);padding:1px 6px;border-radius:5px">`</code> to instantly jump to a real site.</div>
+</div>
 
 <div id="banner"></div>
 
@@ -272,16 +287,23 @@ function unwrapProxyUrl(href) {
 
 /* ---------- official v2 plugins (media cache, live URL, tab handling) ---- */
 const deepLink = (u) => location.origin + BASE + "?u=" + encodeURIComponent(u);
-function buildPlugins() {
+async function buildPlugins() {
   const U = window.$scramjetUtils;
   const plugins = [];
   if (!U) return plugins;
-  try { plugins.push(new U.HttpCachePlugin()); } catch (e) { console.warn("http-cache plugin skipped:", e); }
+  // Cache API can throw in old iOS private browsing; a poisoned cache would
+  // break every request, so probe before installing the HTTP-cache plugin
+  let cacheOk = false;
+  try { cacheOk = "caches" in window && !!(await caches.open("sj-probe")); } catch {}
+  if (cacheOk) { try { plugins.push(new U.HttpCachePlugin()); } catch (e) { console.warn("http-cache plugin skipped:", e); } }
   try { plugins.push(new U.UrlWatcherPlugin((url) => { $("t-url").value = url; })); } catch {}
   try { plugins.push(new U.CatchEscapedLinksPlugin((url) => deepLink(url.href || String(url)))); } catch {}
   try {
     plugins.push(new U.EventHandlerPlugin());
-    plugins.push(new U.LinkHandlerPlugin((href) => window.open(deepLink(href), "_blank")));
+    plugins.push(new U.LinkHandlerPlugin((href) => {
+      const w = window.open(deepLink(href), "_blank");
+      if (!w && frame) frame.go(href); // popup blocked (common on iOS) -> load in the viewer
+    }));
   } catch {}
   return plugins;
 }
@@ -358,7 +380,7 @@ async function navigate(raw, wispSkip = []) {
   banner.style.display = "none";
 
   if (!frame) {
-    frame = controller.createFrame(undefined, { plugins: buildPlugins() });
+    frame = controller.createFrame(undefined, { plugins: await buildPlugins() });
     frame.element.setAttribute("allow", "fullscreen; clipboard-read; clipboard-write; autoplay; encrypted-media; picture-in-picture");
     $("viewer").appendChild(frame.element);
     frame.element.addEventListener("load", () => {
@@ -370,6 +392,48 @@ async function navigate(raw, wispSkip = []) {
   $("t-url").value = url;
   frame.go(url);
 }
+
+/* ---------- cloak / anti-nosy tools ---------- */
+const CLOAKS = {
+  none:      { title: "Scramjet Gateway", icon: null },
+  classroom: { title: "Classes", icon: "https://ssl.gstatic.com/classroom/favicon.png" },
+  docs:      { title: "Google Docs", icon: "https://ssl.gstatic.com/docs/documents/images/kix-favicon7.ico" },
+  drive:     { title: "My Drive - Google Drive", icon: "https://ssl.gstatic.com/images/branding/product/1x/drive_2020q4_32dp.png" },
+  gmail:     { title: "Gmail", icon: "https://ssl.gstatic.com/ui/v1/icons/mail/rfr/gmail.ico" },
+};
+function applyCloak(key) {
+  const c = CLOAKS[key] || CLOAKS.none;
+  document.title = c.title;
+  let link = document.querySelector("link[rel='icon']");
+  if (!link) { link = document.createElement("link"); link.rel = "icon"; document.head.appendChild(link); }
+  if (c.icon) link.href = c.icon;
+  else link.remove();
+  try { localStorage.setItem("sj-cloak", key); } catch {}
+}
+function openInBlank() {
+  const w = window.open("about:blank", "_blank");
+  if (!w) { showError("Popup blocked — allow popups for this site to use about:blank."); return; }
+  const d = w.document;
+  d.body.style.margin = "0";
+  const f = d.createElement("iframe");
+  f.src = location.href;
+  f.style.cssText = "position:fixed;inset:0;border:0;width:100%;height:100%";
+  d.body.appendChild(f);
+}
+$("chip-cloak").addEventListener("click", () => {
+  const box = $("cloakbox");
+  box.style.display = box.style.display === "none" ? "block" : "none";
+});
+$("cloak-sel").addEventListener("change", (e) => applyCloak(e.target.value));
+$("cloak-blank").addEventListener("click", openInBlank);
+// panic key: ` jumps straight to a real site
+addEventListener("keydown", (e) => {
+  if (e.code === "Backquote") location.replace("https://classroom.google.com/");
+});
+try {
+  const saved = localStorage.getItem("sj-cloak");
+  if (saved && CLOAKS[saved]) { $("cloak-sel").value = saved; applyCloak(saved); }
+} catch {}
 
 /* ---------- UI wiring ---------- */
 $("omni").addEventListener("submit", (e) => { e.preventDefault(); navigate($("addr").value); });
