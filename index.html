@@ -150,6 +150,7 @@
 <footer>
   <span>Powered by <a href="https://github.com/MercuryWorkshop/scramjet" target="_blank" rel="noopener">Scramjet</a> (Mercury Workshop)</span>
   <span>Link API: open <code id="api-u">yoursite/?u=&lt;encoded url&gt;</code> to jump straight to a proxied site</span>
+  <span id="api-content" style="display:none">Content API: <code id="api-cu"></code> returns the raw page Scramjet pulled (add <code>&amp;raw=1</code> for plain bytes)</span>
 </footer>
 
 <script>
@@ -363,6 +364,15 @@ async function boot() {
     setChip("wisp", "ok", "wisp " + new URL(chosenWisp).host + " · " + transportKind);
 
     $("api-u").textContent = location.origin + BASE + "?u=<encoded url>";
+
+    // if the optional Node backend is running, advertise the content API too
+    try {
+      const h = await fetch(location.origin + "/api/health", { cache: "no-store", signal: AbortSignal.timeout(3000) });
+      if (h.ok && (await h.json()).ok) {
+        $("api-cu").textContent = location.origin + "/api/fetch?url=<encoded url>";
+        $("api-content").style.display = "";
+      }
+    } catch {}
 
     const u = new URLSearchParams(location.search).get("u"); // deep link
     if (u) navigate(u);
