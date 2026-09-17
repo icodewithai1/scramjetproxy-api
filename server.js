@@ -147,14 +147,195 @@ if (typeof importScripts === "function" && typeof self !== "undefined" && !("win
      ------------------------------------------------------------------------- */
   const http = require("http");
   const path = require("path");
+  const tls = require("tls");
+  const stream = require("stream");
   const express = require("express");
   const { server: wisp, logging } = require("@mercuryworkshop/wisp-js/server");
+  let WSImpl = null, nativeWS = false; // Node >= 22 has global WebSocket; else use `ws`
+  if (typeof WebSocket !== "undefined") { WSImpl = WebSocket; nativeWS = true; }
+  else { try { WSImpl = require("ws"); } catch {} }
 
   const PORT = parseInt(process.env.PORT || "8080", 10);
   logging.set_level(logging.ERROR);
 
   const app = express();
   app.disable("x-powered-by");
+
+  /* ==================== WISP RELAY TUNNEL (fetch like scramjet) ========== */
+  /* Same relays the frontend uses. Wisp is a raw TCP tunnel, so TLS is done
+     in-process (Node's tls over the tunnel) and we speak plain HTTP/1.1. */
+  const RELAYS = ["wss://w2.qwq.sh/ws/", "wss://wisp.mercurywork.shop/wisp/", "wss://hydrovolter.com/wisp/"];
+  const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
+  const BODY_CAP = 5 * 1024 * 1024;
+
+  function openSocket(url, timeout) {
+    return new Promise((resolve, reject) => {
+      const socket = nativeWS ? new WSImpl(url) : new WSImpl(url, { followRedirects: false });
+      const kill = setTimeout(() => { try { socket.close(); } catch {} reject(new Error("ws timeout")); }, timeout);
+      socket.binaryType = "arraybuffer";
+      socket.onopen = () => { clearTimeout(kill); resolve(socket); };
+      socket.onerror = (e) => { clearTimeout(kill); reject(new Error("ws error " + ((e && e.message) || ""))); };
+    });
+  }
+
+  /* wisp framing: [u8 type][u32 stream LE][payload] — types from wisp-js:
+     0x01 CONNECT (u8 proto=1 TCP, u16 port LE, hostname) · 0x02 DATA ·
+     0x03 CONTINUE (u32 buffer_remaining LE) · 0x04 CLOSE · 0x05 INFO      */
+  class WispTunnel {
+    constructor(socket, host, port) {
+      this.socket = socket; this.id = 1; this.host = host;
+      this.acc = Buffer.alloc(0); this.chunks = []; this.pending = null;
+      this.done = false; this.continueRemaining = Infinity; this.continueWaiters = [];
+      socket.onmessage = (ev) => this._onData(Buffer.from(ev.data instanceof ArrayBuffer ? ev.data : ev.data.buffer));
+      socket.onclose = () => this._finish();
+      const c = Buffer.alloc(5 + 3 + Buffer.byteLength(host));
+      c.writeUInt8(0x01, 0); c.writeUInt32LE(this.id, 1);
+      c.writeUInt8(1, 5); c.writeUInt16LE(port, 6);
+      c.write(host, 8, "utf8");
+      socket.send(c);
+    }
+    _finish() { if (!this.done) { this.done = true; this.chunks.push(null); if (this.pending) this.pending(); } }
+    _onData(buf) {
+      this.acc = Buffer.concat([this.acc, buf]);
+      while (this.acc.length >= 5) {
+        const type = this.acc.readUInt8(0);
+        const id = this.acc.readUInt32LE(1);
+        if (type === 0x02) {
+          // DATA has no length prefix — the rest of the ws message is payload
+          const payload = this.acc.subarray(5); this.acc = Buffer.alloc(0);
+          if (id === this.id) { this.chunks.push(Buffer.from(payload)); if (this.pending) this.pending(); }
+          return;
+        }
+        let need = 5, parse = null;
+        if (type === 0x03) { need = 5 + 4; parse = (p) => { this.continueRemaining = p.readUInt32LE(0); const w = this.continueWaiters; this.continueWaiters = []; w.forEach((f) => f()); }; }
+        else if (type === 0x04) { need = 5 + 1; parse = () => this._finish(); }
+        else if (type === 0x05) { need = 5 + 4; parse = () => {}; }
+        else { this.acc = Buffer.alloc(0); return; }
+        if (this.acc.length < need) return;
+        parse(this.acc.subarray(5, need));
+        this.acc = this.acc.subarray(need);
+      }
+    }
+    _read() {
+      return new Promise((res) => {
+        if (this.chunks.length) return res(this.chunks.shift());
+        if (this.done) return res(null);
+        this.pending = () => { this.pending = null; res(this.chunks.length ? this.chunks.shift() : null); };
+      });
+    }
+    async write(data) {
+      if (this.continueRemaining <= 0) await new Promise((r) => this.continueWaiters.push(r));
+      const hdr = Buffer.alloc(5); hdr.writeUInt8(0x02, 0); hdr.writeUInt32LE(this.id, 1);
+      this.socket.send(Buffer.concat([hdr, data]));
+      if (this.continueRemaining !== Infinity) this.continueRemaining = Math.max(0, this.continueRemaining - data.length);
+    }
+    close() { try { this.socket.close(); } catch {} }
+
+    /* Duplex wrapper so node's `tls` can run inside the tunnel */
+    duplex() {
+      const t = this;
+      return new stream.Duplex({
+        read() {
+          t._read().then((c) => { if (c === null) this.push(null); else this.push(c); });
+        },
+        write(chunk, _enc, cb) { t.write(Buffer.from(chunk)).then(() => cb(), cb); },
+        final(cb) { t.close(); cb(); },
+      });
+    }
+  }
+
+  /* HTTP/1.1 chunked transfer-encoding -> plain body */
+  function dechunk(buf) {
+    const out = []; let i = 0;
+    while (i < buf.length) {
+      let nl = buf.indexOf("\r\n", i);
+      if (nl < 0) break;
+      const size = parseInt(buf.toString("latin1", i, nl).split(";")[0], 16);
+      if (!Number.isFinite(size)) break;
+      i = nl + 2;
+      if (size === 0) break;
+      if (i + size > buf.length) { out.push(buf.subarray(i)); break; } // cut short: keep what we have
+      out.push(buf.subarray(i, i + size));
+      i += size + 2;
+    }
+    return Buffer.concat(out);
+  }
+
+  /* one hop: wisp CONNECT -> TLS -> HTTP/1.1 request */
+  function wispHop(relay, targetUrl, timeoutMs = 25000) {
+    return new Promise(async (resolve, reject) => {
+      let tunnel, sock;
+      const bail = (msg) => { try { tunnel && tunnel.close(); sock && sock.destroy(); } catch {} reject(new Error(msg)); };
+      try {
+        const u = new URL(targetUrl);
+        const isHttps = u.protocol === "https:";
+        const host = u.hostname, port = u.port || (isHttps ? 443 : 80);
+        const ws = await openSocket(relay, 12000);
+        tunnel = new WispTunnel(ws, host, port);
+        const deadline = setTimeout(() => bail("tunnel timeout"), timeoutMs);
+
+        let io;
+        if (isHttps) {
+          io = tls.connect({ socket: tunnel.duplex(), servername: host, ALPNProtocols: ["http/1.1"], rejectUnauthorized: false });
+          await new Promise((res, rej) => { io.once("secureConnect", res); io.once("error", rej); });
+        } else {
+          io = tunnel.duplex();
+        }
+
+        const p = u.pathname + u.search;
+        const req = [
+          "GET " + p + " HTTP/1.1",
+          "Host: " + host,
+          "User-Agent: " + UA,
+          "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language: en-US,en;q=0.9",
+          "Accept-Encoding: identity",
+          "Connection: close",
+          "", "",
+        ].join("\r\n");
+        io.write(req);
+
+        const buf = []; let got = 0;
+        while (true) {
+          const c = await new Promise((res) => { io.once("readable", () => res(io.read())); io.once("end", () => res(null)); io.once("error", () => res(null)); });
+          if (c === null) break;
+          buf.push(c); got += c.length;
+          if (got > BODY_CAP) break;
+        }
+        clearTimeout(deadline);
+        const raw = Buffer.concat(buf);
+        const sep = raw.indexOf("\r\n\r\n");
+        if (sep < 0) return bail("malformed response from " + host);
+        const head = raw.subarray(0, sep).toString("latin1").split("\r\n");
+        const m = head[0].match(/^HTTP\/1\.[01] (\d{3})/);
+        if (!m) return bail("bad status line: " + head[0]);
+        const headers = {};
+        head.slice(1).forEach((l) => { const i = l.indexOf(":"); if (i > 0) headers[l.slice(0, i).trim().toLowerCase()] = l.slice(i + 1).trim(); });
+        let body = raw.subarray(sep + 4);
+        if (String(headers["transfer-encoding"] || "").includes("chunked")) body = dechunk(body);
+        try { io.destroy(); } catch {} tunnel.close();
+        resolve({ status: parseInt(m[1], 10), headers, body, via: relay });
+      } catch (e) {
+        bail(String((e && e.message) || e));
+      }
+    });
+  }
+
+  async function relayFetch(targetUrl) {
+    for (const relay of RELAYS) {
+      let r = await wispHop(relay, targetUrl).catch((e) => ({ error: String((e && e.message) || e) }));
+      if (r.error) { console.error("[relay]", relay, "->", r.error); continue; }
+      // follow redirects across relays (fresh tunnel per hop)
+      for (let hops = 0; hops < 4 && r.status >= 300 && r.status < 400 && r.headers.location; hops++) {
+        const next = new URL(r.headers.location, targetUrl).href;
+        r = await wispHop(relay, next).catch((e) => ({ error: String((e && e.message) || e) }));
+        if (r.error) break;
+        r.url = next;
+      }
+      if (!r.error) { r.url = r.url || targetUrl; return r; }
+    }
+    return null;
+  }
 
   /* ============================== PUBLIC API ============================== */
   const hits = new Map();
@@ -182,7 +363,9 @@ if (typeof importScripts === "function" && typeof self !== "undefined" && !("win
         health: origin + "/api/health",
         encode: origin + "/api/encode?url=https://example.com",
         fetch: origin + "/api/fetch?url=https://example.com",
+        fetch_raw: origin + "/api/fetch?url=https://example.com&raw=1",
       },
+      note: "/api/fetch tunnels through the wisp relays (same egress as the browser proxy). Add &raw=1 for raw bytes, &direct=1 to skip relays.",
       wisp: origin.replace(/^http/, "ws") + "/wisp/",
     });
   });
@@ -206,7 +389,11 @@ if (typeof importScripts === "function" && typeof self !== "undefined" && !("win
     }
   });
 
-  // GET /api/fetch?url=... -> server-side fetch, returns the page as JSON
+  // GET /api/fetch?url=... -> fetches the page THROUGH the wisp relays
+  // (same egress the browser proxy uses), returns what it got.
+  //   default: JSON { ok, status, url, contentType, body, ... }
+  //   &raw=1 : raw bytes + original content-type (pipe it straight into curl)
+  //   &direct=1 : skip the relays, plain server fetch
   app.get("/api/fetch", async (req, res) => {
     if (rateLimited(req.ip)) return res.status(429).json({ error: "rate limit exceeded (60 req/min)" });
     const raw = String(req.query.url || "");
@@ -218,18 +405,34 @@ if (typeof importScripts === "function" && typeof self !== "undefined" && !("win
     } catch {
       return res.status(400).json({ error: "invalid url (http/https only)" });
     }
-    try {
-      const r = await fetch(u.href, {
-        redirect: "follow",
-        signal: AbortSignal.timeout(20_000),
-        headers: { "user-agent": "Mozilla/5.0 (X11; Linux x86_64) scramjet-gateway/1.0" },
-      });
-      const buf = Buffer.from(await r.arrayBuffer());
-      const MAX = 512 * 1024;
-      res.json({ ok: r.ok, url: r.url, status: r.status, contentType: r.headers.get("content-type"), bytes: buf.length, truncated: buf.length > MAX, body: buf.subarray(0, MAX).toString("utf8") });
-    } catch (err) {
-      res.status(502).json({ error: "fetch failed", detail: String((err && err.message) || err) });
+    const directOnly = req.query.direct === "1";
+    const wantsRaw = req.query.raw === "1";
+
+    let r = null;
+    if (!directOnly) r = await relayFetch(u.href);
+
+    if (!r) { // relay tunnel unavailable -> honest direct fetch fallback
+      try {
+        const f = await fetch(u.href, { redirect: "follow", signal: AbortSignal.timeout(20_000), headers: { "user-agent": UA } });
+        r = { status: f.status, url: f.url, headers: Object.fromEntries(f.headers), body: Buffer.from(await f.arrayBuffer()), via: "direct" };
+      } catch (err) {
+        return res.status(502).json({ error: "fetch failed", detail: String((err && err.message) || err) });
+      }
     }
+
+    const ct = r.headers["content-type"] || "application/octet-stream";
+    const ok = r.status >= 200 && r.status < 400;
+    if (wantsRaw) {
+      res.status(r.status).set("Content-Type", ct).send(r.body);
+      return;
+    }
+    const isText = /^(text\/|application\/(json|xml|xhtml|javascript)|image\/svg)/.test(ct) || r.body.toString("utf8", 0, 200).includes("<html");
+    res.json({
+      ok, status: r.status, url: r.url, contentType: ct,
+      via: r.via, bytes: r.body.length, truncated: r.body.length > BODY_CAP,
+      body: isText ? r.body.toString("utf8") : r.body.toString("base64"),
+      encoding: isText ? "utf8" : "base64",
+    });
   });
 
   /* =================== STATIC: the site (everything else comes from CDN /
